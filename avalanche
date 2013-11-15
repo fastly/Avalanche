@@ -1,0 +1,116 @@
+#! /usr/bin/env python
+
+import os
+import sys
+import json
+import time
+import atexit
+import random
+import logging
+import settings
+import subprocess
+from optparse import OptionParser
+
+VERSION = "0.1.0"
+
+log = logging.getLogger('avalanche')
+log.addHandler(logging.StreamHandler())
+
+def die(msg):
+    log.error(msg)
+    exit(1)
+
+def call(cmd, exit_on_fail=True):
+    log.debug(cmd)
+    res = subprocess.call(cmd, shell=True, stderr=subprocess.STDOUT)
+    if res != 0 and exit_on_fail:
+        die("error: subprocess returned %d (not 0)"%(res))
+        return res
+
+def tc(iface, args):
+    return "tc qdisc add dev %s parent 1:3 handle 30: %s"%(iface, args)
+
+def generate_fault():
+    """pick a fault from faults uniformly at random with probability p_fault"""
+
+    if isinstance(settings.faults, list):
+        faults = {a:1.0/len(settings.faults) for a in settings.faults}
+    elif isinstance(settings.faults, dict):
+        faults = settings.faults
+    else:
+        die("can't parse faults")
+
+    # iterate through each action, and check to see if the random number fell into a range
+    # corresponding to the probability of the action. if we don't pick an action,
+    # choose to undo all actions.
+    r = random.uniform(0,1)
+    s = 0
+    for a,p in faults.items():
+        # pick an action with uniform probability equal to P(fault)/(number of faults)
+        s += settings.p_fault*p
+        if s >= r:
+            return a()
+    return None
+
+def clear_faults():
+    """undo all currently enabled faults"""
+    if settings.debug: return
+    for iface in settings.interfaces:
+        call("tc qdisc del dev %s root"%(iface), exit_on_fail=False)
+
+def cleanup(active_faults):
+    """run on exit"""
+    if active_faults:
+        log.info("Cleaning up...")
+        clear_faults()
+    log.info("Exiting.")
+
+if __name__ == "__main__":
+    parser = OptionParser()
+    parser.add_option("-d", "--debug", dest="debug", default=False,
+                      action="store_true", help="log the faults, but do not inject them")
+    parser.add_option("-v", "--version", dest="version", default=False,
+                      action="store_true", help="print the avalanche version and exit")
+    (opts, args) = parser.parse_args()
+
+    if opts.version:
+        print VERSION
+        exit(0)
+
+    log.setLevel(settings.log_level)
+
+    if opts.debug:
+        settings.debug = opts.debug
+        log.setLevel(logging.DEBUG)
+
+    if sum([v for v in settings.faults.values()]) != 1:
+        die("fault probabilities don't sum to 1")
+
+    active_faults = []
+    atexit.register(lambda: cleanup(active_faults))
+
+    log.info("Starting Avalanche v%s"%(VERSION))
+    log.info("seed=%d,delay=%dms,ports=%s"%(settings.seed, settings.delay,str(settings.ports)))
+
+    random.seed(settings.seed)
+    while True:
+        if active_faults:
+            clear_faults()
+            active_faults = []
+
+        fault = generate_fault()
+        if fault:
+            active_faults.append(fault)
+            log.info("fault: %s"%(fault.desc()))
+
+            if not settings.debug:
+                for iface in settings.interfaces:
+                    call("tc qdisc add dev %s root handle 1: prio"%(iface))
+                    call(tc(iface, fault.action()))
+                    for port in settings.ports:
+                        call("tc filter add dev %s parent 1:0 protocol ip u32 match ip dport %d 0xffff flowid 1:3"%(iface, port))
+                        call("tc filter add dev %s parent 1:0 protocol ip u32 match ip sport %d 0xffff flowid 1:3"%(iface, port))
+        else:
+            log.info("fault: none")
+
+        time.sleep(settings.delay)
